@@ -1,0 +1,420 @@
+package backend
+
+import (
+	"context"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"s3proxy/logger"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go/middleware"
+	//"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/result"
+)
+
+// Manager реализует BackendProvider и управляет состоянием бэкендов
+type Manager struct {
+	config   ManagerConfig
+	backends map[string]*Backend
+	metrics  *Metrics // Для экспорта метрик состояния
+
+	// Управление жизненным циклом
+	mu       sync.RWMutex
+	running  bool
+	stopChan chan struct{}
+	wg       sync.WaitGroup
+}
+
+// NewManager создает новый менеджер бэкендов
+func NewManager(cfg *Config) (*Manager, error) {
+	if cfg == nil {
+		cfg = DefaultConfig()
+	}
+
+	// Валидируем конфигурацию
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	manager := &Manager{
+		config:   cfg.Manager,
+		backends: make(map[string]*Backend),
+		metrics:  NewMetrics(),
+		stopChan: make(chan struct{}),
+	}
+
+	// Инициализируем бэкенды
+	for id, backendConfig := range cfg.Backends {
+		backend, err := manager.createBackend(id, backendConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create backend '%s': %w", id, err)
+		}
+		manager.backends[id] = backend
+	}
+
+	logger.Info("Backend manager initialized with %d backends", len(manager.backends))
+	for id, backend := range manager.backends {
+		logger.Info("  - %s: %s (bucket: %s)", id, backend.Config.Endpoint, backend.Config.Bucket)
+	}
+
+	return manager, nil
+}
+
+// createBackend создает и настраивает один бэкенд
+// Эта функция является методом вашей структуры Manager.
+func (m *Manager) createBackend(id string, cfg BackendConfig) (*Backend, error) {
+	// ... (код создания awsConfig без изменений) ...
+	awsConfig, err := config.LoadDefaultConfig(context.Background(),
+		config.WithRegion(cfg.Region),
+		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
+			cfg.AccessKey,
+			cfg.SecretKey,
+			"",
+		)),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load AWS config for backend %s: %w", id, err)
+	}
+
+	// --- Создаем основной S3 клиент ---
+	defaultS3Client := s3.NewFromConfig(awsConfig, func(o *s3.Options) {
+		o.UsePathStyle = true
+		if cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(cfg.Endpoint)
+		}
+	})
+	// !!! НОВЫЙ ЛОГ !!!
+	logger.Debug("Backend '%s': created default S3 client at address [%p]", id, defaultS3Client)
+
+	backend := &Backend{
+		ID:          id,
+		Config:      cfg,
+		S3Client:    defaultS3Client,
+		state:       m.config.InitialState,
+		windowStart: time.Now(),
+	}
+
+	// --- Если бэкенд работает по HTTP, создаем ВТОРОЙ, специальный клиент ---
+	isHttp := cfg.Endpoint != "" && strings.HasPrefix(strings.ToLower(cfg.Endpoint), "http://")
+	if isHttp {
+		logger.Warn("Backend '%s' uses HTTP. Creating a special streaming client for PutObject.", id)
+		streamingS3Client := s3.NewFromConfig(awsConfig, func(o *s3.Options) {
+			o.UsePathStyle = true
+			if cfg.Endpoint != "" {
+				o.BaseEndpoint = aws.String(cfg.Endpoint)
+			}
+			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+			// Удаляем middleware для вычисления SHA256. Это заставит SDK использовать UNSIGNED-PAYLOAD.
+			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+				return v4.RemoveComputePayloadSHA256Middleware(stack)
+			})
+		})
+		backend.StreamingPutClient = streamingS3Client
+	}
+
+	logger.Info("Created backend '%s' (Endpoint: %s, Bucket: %s) with initial state %s", id, cfg.Endpoint, cfg.Bucket, backend.state)
+	return backend, nil
+}
+
+// Start запускает менеджер бэкендов
+func (m *Manager) Start() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.running {
+		return fmt.Errorf("backend manager is already running")
+	}
+
+	logger.Info("Starting backend manager...")
+
+	// Запускаем горутину для активных проверок здоровья
+	m.wg.Add(1)
+	go m.runHealthChecks()
+
+	m.running = true
+	logger.Info("Backend manager started")
+
+	return nil
+}
+
+// Stop останавливает менеджер бэкендов
+func (m *Manager) Stop() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if !m.running {
+		return nil
+	}
+
+	logger.Info("Stopping backend manager...")
+
+	// Сигнализируем о остановке
+	close(m.stopChan)
+
+	// Ждем завершения всех горутин
+	m.wg.Wait()
+
+	// Создаем новый канал для возможного повторного запуска
+	m.stopChan = make(chan struct{})
+
+	m.running = false
+	logger.Info("Backend manager stopped")
+
+	return nil
+}
+
+// IsRunning возвращает true, если менеджер запущен
+func (m *Manager) IsRunning() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.running
+}
+
+// GetLiveBackends возвращает список работоспособных бэкендов
+func (m *Manager) GetLiveBackends() []*Backend {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	var liveBackends []*Backend
+	for _, backend := range m.backends {
+		state := backend.GetState()
+		if state == StateUp {
+			liveBackends = append(liveBackends, backend)
+		}
+	}
+
+	logger.Debug("GetLiveBackends: returning %d out of %d backends", len(liveBackends), len(m.backends))
+	return liveBackends
+}
+
+// GetAllBackends возвращает список всех бэкендов
+func (m *Manager) GetAllBackends() []*Backend {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	backends := make([]*Backend, 0, len(m.backends))
+	for _, backend := range m.backends {
+		backends = append(backends, backend)
+	}
+
+	return backends
+}
+
+// GetBackend возвращает бэкенд по ID
+func (m *Manager) GetBackend(id string) (*Backend, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	backend, exists := m.backends[id]
+	return backend, exists
+}
+
+// ReportSuccess сообщает об успешной операции (пассивная проверка)
+func (m *Manager) ReportSuccess(result *BackendResult) {
+	m.mu.RLock()
+	backend, exists := m.backends[result.BackendID]
+	m.mu.RUnlock()
+
+	if !exists {
+		logger.Warn("ReportSuccess: backend '%s' not found", result.BackendID)
+		return
+	}
+
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+
+	// Сбрасываем счетчик последовательных неудач
+	backend.consecutiveFailures = 0
+	backend.consecutiveSuccesses++
+
+	// Очищаем окно Circuit Breaker при успехе
+	backend.recentFailures = 0
+	backend.windowStart = time.Now()
+
+	logger.Debug("ReportSuccess: backend '%s', consecutive successes: %d",
+		result.BackendID, backend.consecutiveSuccesses)
+
+	m.metrics.BackendRequestsTotal.WithLabelValues(result.BackendID, result.Method, strconv.Itoa(result.StatusCode)).Inc()
+	m.metrics.BackendLatency.WithLabelValues(result.BackendID, result.Method).Observe(float64(result.Duration.Seconds()))
+	m.metrics.BackendBytesRead.WithLabelValues(result.BackendID).Add(float64(result.BytesRead))
+	m.metrics.BackendBytesWrite.WithLabelValues(result.BackendID).Add(float64(result.BytesWritten))
+}
+
+// ReportFailure сообщает о неудачной операции (пассивная проверка)
+func (m *Manager) ReportFailure(result *BackendResult) {
+	m.mu.RLock()
+	backend, exists := m.backends[result.BackendID]
+	m.mu.RUnlock()
+
+	if !exists {
+		logger.Warn("ReportFailure: backend '%s' not found", result.BackendID)
+		return
+	}
+
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+
+	// Обновляем статистику
+	backend.consecutiveSuccesses = 0
+	backend.consecutiveFailures++
+	backend.lastError = result.Err
+
+	// Обновляем окно Circuit Breaker
+	now := time.Now()
+	if now.Sub(backend.windowStart) > m.config.CircuitBreakerWindow {
+		// Сбрасываем окно
+		backend.recentFailures = 1
+		backend.windowStart = now
+	} else {
+		backend.recentFailures++
+	}
+
+	logger.Debug("ReportFailure: backend '%s', consecutive failures: %d, recent failures: %d, error: %v",
+		result.BackendID, backend.consecutiveFailures, backend.recentFailures, result.Err)
+
+	// Проверяем Circuit Breaker
+	if backend.recentFailures >= m.config.CircuitBreakerThreshold && backend.state != StateDown {
+		logger.Warn("Circuit breaker triggered for backend '%s': %d failures in %v",
+			result.BackendID, backend.recentFailures, m.config.CircuitBreakerWindow)
+		setBackendState(m, backend, StateDown)
+	}
+
+	m.metrics.BackendRequestsTotal.WithLabelValues(result.BackendID, result.Method, strconv.Itoa(result.StatusCode)).Inc()
+	m.metrics.BackendLatency.WithLabelValues(result.BackendID, result.Method).Observe(float64(result.Duration.Seconds()))
+	m.metrics.BackendBytesRead.WithLabelValues(result.BackendID).Add(float64(result.BytesRead))
+	m.metrics.BackendBytesWrite.WithLabelValues(result.BackendID).Add(float64(result.BytesWritten))
+}
+
+// runHealthChecks выполняет активные проверки здоровья в фоновом режиме
+func (m *Manager) runHealthChecks() {
+	defer m.wg.Done()
+
+	ticker := time.NewTicker(m.config.HealthCheckInterval)
+	defer ticker.Stop()
+
+	logger.Debug("Doing initial health check")
+	m.performHealthChecks()
+
+	logger.Debug("Health check routine started with interval %v", m.config.HealthCheckInterval)
+	for {
+		select {
+		case <-ticker.C:
+			m.performHealthChecks()
+		case <-m.stopChan:
+			logger.Debug("Health check routine stopped")
+			return
+		}
+	}
+}
+
+// performHealthChecks выполняет проверку всех бэкендов
+func (m *Manager) performHealthChecks() {
+	m.mu.RLock()
+	backends := make([]*Backend, 0, len(m.backends))
+	for _, backend := range m.backends {
+		backends = append(backends, backend)
+	}
+	m.mu.RUnlock()
+
+	logger.Debug("Performing health checks for %d backends", len(backends))
+
+	// Проверяем каждый бэкенд асинхронно
+	var wg sync.WaitGroup
+	for _, backend := range backends {
+		wg.Add(1)
+		go func(b *Backend) {
+			defer wg.Done()
+			m.checkBackend(b)
+		}(backend)
+	}
+
+	wg.Wait()
+	logger.Debug("Health checks completed")
+}
+
+// checkBackend выполняет проверку одного бэкенда
+func (m *Manager) checkBackend(backend *Backend) {
+	ctx, cancel := context.WithTimeout(context.Background(), m.config.CheckTimeout)
+	defer cancel()
+
+	logger.Debug("Checking backend %s (state: %s)", backend.ID, backend.GetState())
+
+	// Выполняем легковесную проверку - HeadBucket
+	_, err := backend.S3Client.HeadBucket(ctx, &s3.HeadBucketInput{
+		Bucket: aws.String(backend.Config.Bucket),
+	})
+
+	// Обновляем состояние бэкенда
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+
+	backend.lastCheckTime = time.Now()
+	oldState := backend.state
+
+	if err != nil {
+		// Неудачная проверка
+		backend.lastError = err
+		backend.consecutiveSuccesses = 0
+		backend.consecutiveFailures++
+
+		logger.Debug("Backend %s health check failed: %v (consecutive failures: %d)",
+			backend.ID, err, backend.consecutiveFailures)
+
+		// Логика переходов состояний при неудаче
+		switch backend.state {
+		case StateUp:
+			if backend.consecutiveFailures >= m.config.FailureThreshold {
+				setBackendState(m, backend, StateDown)
+				logger.Warn("Backend %s transitioned from UP to DOWN after %d consecutive failures",
+					backend.ID, backend.consecutiveFailures)
+			}
+		case StateProbing:
+			// Из PROBING сразу в DOWN при любой неудаче
+			setBackendState(m, backend, StateDown)
+			logger.Warn("Backend %s transitioned from PROBING to DOWN after health check failure", backend.ID)
+		case StateDown:
+			// Остаемся в DOWN
+		}
+	} else {
+		// Успешная проверка
+		backend.lastError = nil
+		backend.consecutiveFailures = 0
+		backend.consecutiveSuccesses++
+
+		logger.Debug("Backend %s health check succeeded (consecutive successes: %d)",
+			backend.ID, backend.consecutiveSuccesses)
+
+		// Логика переходов состояний при успехе
+		switch backend.state {
+		case StateDown:
+			// Из DOWN в PROBING при первом успехе
+			setBackendState(m, backend, StateProbing)
+			logger.Info("Backend %s transitioned from DOWN to PROBING after successful health check", backend.ID)
+		case StateProbing:
+			if backend.consecutiveSuccesses >= m.config.SuccessThreshold {
+				setBackendState(m, backend, StateUp)
+				logger.Info("Backend %s transitioned from PROBING to UP after %d consecutive successes",
+					backend.ID, backend.consecutiveSuccesses)
+			}
+		case StateUp:
+			// Остаемся в UP
+		}
+	}
+
+	// Логируем изменения состояния
+	if oldState != backend.state {
+		logger.Info("Backend %s state changed: %s -> %s", backend.ID, oldState, backend.state)
+	}
+}
+
+func setBackendState(m *Manager, backend *Backend, state BackendState) {
+	backend.state = state
+	m.metrics.BackendState.WithLabelValues(backend.ID).Set(backend.state.ToFloat64())
+}
