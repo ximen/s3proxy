@@ -10,7 +10,6 @@ import (
 // Monitor представляет основной интерфейс модуля мониторинга
 type Monitor struct {
 	config  *Config
-	metrics *Metrics
 	server  *Server
 }
 
@@ -25,15 +24,11 @@ func New(config *Config) (*Monitor, error) {
 		return nil, fmt.Errorf("invalid monitoring config: %w", err)
 	}
 	
-	// Создаем метрики
-	metrics := NewMetrics()
-	
 	// Создаем сервер
-	server := NewServer(config, metrics)
+	server := NewServer(config)
 	
 	monitor := &Monitor{
 		config:  config,
-		metrics: metrics,
 		server:  server,
 	}
 	
@@ -79,11 +74,6 @@ func (m *Monitor) Stop(ctx context.Context) error {
 	return nil
 }
 
-// GetMetrics возвращает экземпляр метрик для использования в других модулях
-func (m *Monitor) GetMetrics() *Metrics {
-	return m.metrics
-}
-
 // GetConfig возвращает конфигурацию мониторинга
 func (m *Monitor) GetConfig() *Config {
 	return m.config
@@ -92,9 +82,4 @@ func (m *Monitor) GetConfig() *Config {
 // IsEnabled возвращает true, если мониторинг включен
 func (m *Monitor) IsEnabled() bool {
 	return m.config.Enabled
-}
-
-// GetMetricsURL возвращает URL эндпоинта метрик
-func (m *Monitor) GetMetricsURL() string {
-	return m.server.GetMetricsURL()
 }

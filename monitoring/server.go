@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"runtime"
-	"time"
 
 	"s3proxy/logger"
 
@@ -15,7 +13,6 @@ import (
 // Server представляет HTTP сервер для экспорта метрик Prometheus
 type Server struct {
 	config  *Config
-	metrics *Metrics
 	server  *http.Server
 
 	// Канал для остановки сбора системных метрик
@@ -23,14 +20,13 @@ type Server struct {
 }
 
 // NewServer создает новый сервер метрик
-func NewServer(config *Config, metrics *Metrics) *Server {
+func NewServer(config *Config) *Server {
 	if config == nil {
 		config = DefaultConfig()
 	}
 
 	return &Server{
 		config:            config,
-		metrics:           metrics,
 		stopSystemMetrics: make(chan struct{}),
 	}
 }
@@ -61,11 +57,6 @@ func (s *Server) Start() error {
 		Handler:      mux,
 		ReadTimeout:  s.config.ReadTimeout,
 		WriteTimeout: s.config.WriteTimeout,
-	}
-
-	// Запускаем сбор системных метрик в отдельной горутине
-	if s.config.EnableSystemMetrics {
-		go s.collectSystemMetrics()
 	}
 
 	// Запускаем сервер в отдельной горутине
@@ -113,39 +104,3 @@ func (s *Server) readyHealthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "{\"status\": \"OK\"}")
 }
 
-// collectSystemMetrics собирает системные метрики в фоновом режиме
-func (s *Server) collectSystemMetrics() {
-	logger.Debug("Starting system metrics collection with interval %v", s.config.SystemMetricsInterval)
-
-	ticker := time.NewTicker(s.config.SystemMetricsInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			s.updateSystemMetrics()
-		case <-s.stopSystemMetrics:
-			logger.Debug("Stopping system metrics collection")
-			return
-		}
-	}
-}
-
-// updateSystemMetrics обновляет системные метрики
-func (s *Server) updateSystemMetrics() {
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-
-	// Обновляем метрику использования памяти
-	s.metrics.MemoryUsage.Set(float64(memStats.Alloc))
-
-	logger.Debug("Updated system metrics: memory_usage=%d bytes", memStats.Alloc)
-}
-
-// GetMetricsURL возвращает полный URL эндпоинта метрик
-func (s *Server) GetMetricsURL() string {
-	if !s.config.Enabled {
-		return ""
-	}
-	return fmt.Sprintf("http://localhost%s%s", s.config.ListenAddress, s.config.MetricsPath)
-}

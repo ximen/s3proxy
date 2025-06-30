@@ -185,7 +185,7 @@ func main() {
 
 	logger.Info("S3 Proxy started successfully")
 	if monitor != nil && monitor.IsEnabled() {
-		logger.Info("Metrics available at: %s", monitor.GetMetricsURL())
+		logger.Info("Metrics available at: %s", config.Monitoring.ListenAddress)
 	}
 	if backendManager != nil && backendManager.IsRunning() {
 		logger.Info("Backend manager running with %d backends", len(backendManager.GetAllBackends()))
