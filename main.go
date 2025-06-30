@@ -65,24 +65,6 @@ func main() {
 	logger.Info("S3 Proxy API Gateway starting...")
 	logger.Info("Log level: %s", level.String())
 
-	// Создаем и запускаем модуль мониторинга
-	var monitor *monitoring.Monitor
-	if !*disableMetrics && config.Monitoring.Enabled {
-		monitor, err = monitoring.New(&config.Monitoring)
-		if err != nil {
-			log.Fatalf("Failed to create monitoring module: %v", err)
-		}
-
-		err = monitor.Start()
-		if err != nil {
-			log.Fatalf("Failed to start monitoring module: %v", err)
-		}
-
-		logger.Info("Monitoring enabled on %s", config.Monitoring.ListenAddress)
-	} else {
-		logger.Info("Monitoring disabled")
-	}
-
 	// Получаем метрики для передачи в модули (если мониторинг включен)
 	// TODO: Метрики должны определяться в модулях, а не в mnitoring
 	// var metrics *monitoring.Metrics
@@ -111,6 +93,24 @@ func main() {
 		}
 	} else {
 		logger.Info("Backend manager disabled")
+	}
+
+	// Создаем и запускаем модуль мониторинга
+	var monitor *monitoring.Monitor
+	if !*disableMetrics && config.Monitoring.Enabled {
+		monitor, err = monitoring.New(&config.Monitoring, backendManager)
+		if err != nil {
+			log.Fatalf("Failed to create monitoring module: %v", err)
+		}
+
+		err = monitor.Start()
+		if err != nil {
+			log.Fatalf("Failed to start monitoring module: %v", err)
+		}
+
+		logger.Info("Monitoring enabled on %s", config.Monitoring.ListenAddress)
+	} else {
+		logger.Info("Monitoring disabled")
 	}
 
 	// Создаем конфигурацию API Gateway
@@ -193,32 +193,47 @@ func main() {
 
 	// Ждем сигнал для остановки
 	sig := <-sigChan
-	logger.Info("Received signal %v, shutting down...", sig)
+	logger.Info("Received signal %v, initiating graceful shutdown...", sig)
+
+	// Уведомляем мониторинг о начале остановки
+	if monitor != nil {
+		monitor.InitiateShutdown()
+	}
 
 	// Создаем контекст с таймаутом для graceful shutdown
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Останавливаем API Gateway
-	if err := gateway.Stop(ctx); err != nil {
-		logger.Error("Error stopping API Gateway: %v", err)
-	}
+	// Канал для отслеживания завершения shutdown
+	done := make(chan struct{})
 
-	// Останавливаем backend manager
-	if backendManager != nil {
-		if err := backendManager.Stop(); err != nil {
-			logger.Error("Error stopping backend manager: %v", err)
+	// Запускаем graceful shutdown в отдельной горутине
+	go func() {
+		// Останавливаем API Gateway
+		if err := gateway.Stop(shutdownCtx); err != nil {
+			logger.Error("Error stopping API Gateway: %v", err)
 		}
-	}
 
-	// Останавливаем мониторинг
-	if monitor != nil {
-		if err := monitor.Stop(ctx); err != nil {
-			logger.Error("Error stopping monitoring: %v", err)
+		// Останавливаем backend manager
+		if backendManager != nil {
+			if err := backendManager.Stop(); err != nil {
+				logger.Error("Error stopping backend manager: %v", err)
+			}
 		}
+
+		close(done)
+	}()
+
+	// Ждем либо завершения shutdown, либо истечения таймаута
+	select {
+	case <-done:
+		logger.Info("Graceful shutdown completed successfully")
+	case <-shutdownCtx.Done():
+		logger.Warn("Graceful shutdown timed out, forcing termination")
 	}
 
 	logger.Info("S3 Proxy stopped")
+
 }
 
 // applyCommandLineOverrides применяет переопределения из командной строки

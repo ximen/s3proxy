@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"s3proxy/backend"
 	"s3proxy/logger"
 )
 
@@ -11,31 +12,33 @@ import (
 type Monitor struct {
 	config  *Config
 	server  *Server
+	manager *backend.Manager
 }
 
 // New создает новый экземпляр Monitor
-func New(config *Config) (*Monitor, error) {
+func New(config *Config, manager *backend.Manager) (*Monitor, error) {
 	if config == nil {
 		config = DefaultConfig()
 	}
-	
+
 	// Валидируем конфигурацию
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid monitoring config: %w", err)
 	}
-	
+
 	// Создаем сервер
-	server := NewServer(config)
-	
+	server := NewServer(config, manager)
+
 	monitor := &Monitor{
 		config:  config,
 		server:  server,
+		manager: manager,
 	}
-	
+
 	logger.Info("Monitoring module initialized")
-	logger.Debug("Monitoring config: enabled=%v, listen=%s, path=%s", 
+	logger.Debug("Monitoring config: enabled=%v, listen=%s, path=%s",
 		config.Enabled, config.ListenAddress, config.MetricsPath)
-	
+
 	return monitor, nil
 }
 
@@ -45,14 +48,14 @@ func (m *Monitor) Start() error {
 		logger.Info("Monitoring is disabled")
 		return nil
 	}
-	
+
 	logger.Info("Starting monitoring module...")
-	
+
 	// Запускаем HTTP сервер метрик
 	if err := m.server.Start(); err != nil {
 		return fmt.Errorf("failed to start metrics server: %w", err)
 	}
-	
+
 	logger.Info("Monitoring module started successfully")
 	return nil
 }
@@ -62,14 +65,14 @@ func (m *Monitor) Stop(ctx context.Context) error {
 	if !m.config.Enabled {
 		return nil
 	}
-	
+
 	logger.Info("Stopping monitoring module...")
-	
+
 	// Останавливаем HTTP сервер
 	if err := m.server.Stop(ctx); err != nil {
 		return fmt.Errorf("failed to stop metrics server: %w", err)
 	}
-	
+
 	logger.Info("Monitoring module stopped")
 	return nil
 }
@@ -82,4 +85,8 @@ func (m *Monitor) GetConfig() *Config {
 // IsEnabled возвращает true, если мониторинг включен
 func (m *Monitor) IsEnabled() bool {
 	return m.config.Enabled
+}
+
+func (m *Monitor) InitiateShutdown() {
+	m.server.shuttingDown.Store(true)
 }

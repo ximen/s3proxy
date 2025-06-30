@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 
+	"s3proxy/backend"
 	"s3proxy/logger"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -12,23 +14,28 @@ import (
 
 // Server представляет HTTP сервер для экспорта метрик Prometheus
 type Server struct {
-	config  *Config
-	server  *http.Server
+	config            *Config
+	server            *http.Server
+	backendManager    *backend.Manager
+	shuttingDown      atomic.Bool
 
 	// Канал для остановки сбора системных метрик
 	stopSystemMetrics chan struct{}
 }
 
 // NewServer создает новый сервер метрик
-func NewServer(config *Config) *Server {
+func NewServer(config *Config, backendManager *backend.Manager) *Server {
 	if config == nil {
 		config = DefaultConfig()
 	}
 
-	return &Server{
+	s := &Server{
 		config:            config,
+		backendManager:    backendManager,
 		stopSystemMetrics: make(chan struct{}),
 	}
+	s.shuttingDown.Store(false)
+	return s
 }
 
 // Start запускает HTTP сервер для метрик
@@ -47,7 +54,6 @@ func (s *Server) Start() error {
 	mux.Handle(s.config.MetricsPath, promhttp.Handler())
 
 	// Добавляем health check эндпоинты
-	mux.HandleFunc("/health", s.healthHandler)
 	mux.HandleFunc("/health/live", s.liveHealthHandler)
 	mux.HandleFunc("/health/ready", s.readyHealthHandler)
 
@@ -85,22 +91,31 @@ func (s *Server) Stop(ctx context.Context) error {
 	return s.server.Shutdown(ctx)
 }
 
-// healthHandler обрабатывает запросы health check
-func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, `{"status":"ok","service":"s3proxy-monitoring"}`)
-}
-
 // liveHealthHandler обрабатывает запросы /health/live
 func (s *Server) liveHealthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\": \"OK\"}")
+	fmt.Fprintf(w, `{"status":"ok"}`)
 }
 
-// liveHealthHandler обрабатывает запросы /health/ready
+// readyHealthHandler обрабатывает запросы /health/ready
 func (s *Server) readyHealthHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "{\"status\": \"OK\"}")
-}
+	w.Header().Set("Content-Type", "application/json")
 
+	// Проверяем, не находимся ли мы в состоянии graceful shutdown
+	if s.shuttingDown.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `{"status":"shutting down"}`)
+		return
+	}
+
+	// Проверяем, есть ли живые бэкенды (если backendManager доступен)
+	if s.backendManager != nil && len(s.backendManager.GetLiveBackends()) == 0 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `{"status":"no live backends"}`)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"ok"}`)
+}
