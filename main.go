@@ -40,7 +40,7 @@ func main() {
 	// Загружаем конфигурацию
 	var config *AppConfig
 	var err error
-	
+
 	if *configFile != "" {
 		logger.Info("Loading configuration from file: %s", *configFile)
 		config, err = LoadConfig(*configFile)
@@ -49,13 +49,13 @@ func main() {
 		}
 		logger.Info("Configuration loaded successfully")
 	} else {
-		logger.Info("Using default configuration")
-		config = DefaultAppConfig()
+		logger.Error("Config file not provided or incorrect. Exiting.")
+		os.Exit(1)
 	}
 
 	// Применяем переопределения из командной строки
-	applyCommandLineOverrides(config, 
-		*listenAddr, *tlsCert, *tlsKey, *readTimeout, *writeTimeout, 
+	applyCommandLineOverrides(config,
+		*listenAddr, *tlsCert, *tlsKey, *readTimeout, *writeTimeout,
 		*useMock, *logLevel, *metricsAddr, *disableMetrics)
 
 	// Устанавливаем уровень логирования
@@ -72,12 +72,12 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to create monitoring module: %v", err)
 		}
-		
+
 		err = monitor.Start()
 		if err != nil {
 			log.Fatalf("Failed to start monitoring module: %v", err)
 		}
-		
+
 		logger.Info("Monitoring enabled on %s", config.Monitoring.ListenAddress)
 	} else {
 		logger.Info("Monitoring disabled")
@@ -97,14 +97,14 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to create backend manager: %v", err)
 		}
-		
+
 		err = backendManager.Start()
 		if err != nil {
 			log.Fatalf("Failed to start backend manager: %v", err)
 		}
-		
+
 		logger.Info("Backend manager enabled with %d backends", len(backendManager.GetAllBackends()))
-		
+
 		// Логируем информацию о бэкендах
 		for _, b := range backendManager.GetAllBackends() {
 			logger.Info("  - %s: %s (bucket: %s)", b.ID, b.Config.Endpoint, b.Config.Bucket)
@@ -123,35 +123,35 @@ func main() {
 		handler = handlers.NewMockHandler()
 	} else {
 		logger.Info("Using Policy & Routing Engine")
-		
+
 		// Создаем аутентификатор
 		authenticator, err := auth.NewAuthenticatorFromConfig(&config.Auth)
 		if err != nil {
 			log.Fatalf("Failed to create authenticator: %v", err)
 		}
-		
+
 		// Логируем доступные учетные данные
 		logger.Info("Authentication configured with %d users:", len(config.Auth.Static.Users))
 		for _, user := range config.Auth.Static.Users {
 			logger.Info("  - %s (%s)", user.DisplayName, user.AccessKey)
 		}
-		
+
 		// Создаем реальные исполнители
 		// Replicator для операций записи
 		replicatorConfig := replicator.DefaultConfig() // Используем конфигурацию по умолчанию для replicator
 		//backendAdapter := replicator.NewBackendAdapter(backendManager)
 		replicatorInstance := replicator.NewReplicator(backendManager, replicatorConfig)
-		
+
 		// Fetcher для операций чтения
 		cache := fetch.NewStubCache() // Пока используем заглушку кэша
 		fetcherInstance := fetch.NewFetcher(backendManager, cache, config.Server.VirtualBucket)
-		
+
 		// Логируем политики маршрутизации``
 		logger.Info("Routing policies configured:")
 		logger.Info("  PUT operations: ack=%s", config.Routing.Policies.Put.AckLevel)
 		logger.Info("  DELETE operations: ack=%s", config.Routing.Policies.Delete.AckLevel)
 		logger.Info("  GET operations: strategy=%s", config.Routing.Policies.Get.Strategy)
-		
+
 		// Создаем Policy & Routing Engine
 		engine := routing.NewEngine(authenticator, replicatorInstance, fetcherInstance, &config.Routing)
 		handler = engine
@@ -222,54 +222,54 @@ func main() {
 }
 
 // applyCommandLineOverrides применяет переопределения из командной строки
-func applyCommandLineOverrides(config *AppConfig, 
-	listenAddr, tlsCert, tlsKey string, 
+func applyCommandLineOverrides(config *AppConfig,
+	listenAddr, tlsCert, tlsKey string,
 	readTimeout, writeTimeout time.Duration,
 	useMock bool, logLevel, metricsAddr string, disableMetrics bool) {
-	
+
 	// Переопределения сервера
 	if listenAddr != "" {
 		config.Server.ListenAddress = listenAddr
 		logger.Debug("Override: server.listen_address = %s", listenAddr)
 	}
-	
+
 	if tlsCert != "" {
 		config.Server.TLSCertFile = tlsCert
 		logger.Debug("Override: server.tls_cert_file = %s", tlsCert)
 	}
-	
+
 	if tlsKey != "" {
 		config.Server.TLSKeyFile = tlsKey
 		logger.Debug("Override: server.tls_key_file = %s", tlsKey)
 	}
-	
+
 	if readTimeout > 0 {
 		config.Server.ReadTimeout = readTimeout
 		logger.Debug("Override: server.read_timeout = %v", readTimeout)
 	}
-	
+
 	if writeTimeout > 0 {
 		config.Server.WriteTimeout = writeTimeout
 		logger.Debug("Override: server.write_timeout = %v", writeTimeout)
 	}
-	
+
 	if useMock {
 		config.Server.UseMock = true
 		logger.Debug("Override: server.use_mock = true")
 	}
-	
+
 	// Переопределения логирования
 	if logLevel != "" {
 		config.Logging.Level = logLevel
 		logger.Debug("Override: logging.level = %s", logLevel)
 	}
-	
+
 	// Переопределения мониторинга
 	if metricsAddr != "" {
 		config.Monitoring.ListenAddress = metricsAddr
 		logger.Debug("Override: monitoring.listen_address = %s", metricsAddr)
 	}
-	
+
 	if disableMetrics {
 		config.Monitoring.Enabled = false
 		logger.Debug("Override: monitoring.enabled = false")

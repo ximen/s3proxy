@@ -31,8 +31,8 @@ type ManagerConfig struct {
 
 // Config содержит полную конфигурацию модуля
 type Config struct {
-	Manager  ManagerConfig                `yaml:"manager"`
-	Backends map[string]BackendConfig     `yaml:"backends"`
+	Manager  ManagerConfig            `yaml:"manager"`
+	Backends map[string]BackendConfig `yaml:"backends"`
 }
 
 // DefaultManagerConfig возвращает конфигурацию менеджера по умолчанию
@@ -49,20 +49,20 @@ func DefaultManagerConfig() ManagerConfig {
 }
 
 // DefaultConfig возвращает конфигурацию по умолчанию
-func DefaultConfig() *Config {
-	return &Config{
-		Manager: DefaultManagerConfig(),
-		Backends: map[string]BackendConfig{
-			"local-minio": {
-				Endpoint:  "http://localhost:9000",
-				Region:    "us-east-1",
-				Bucket:    "test-bucket",
-				AccessKey: "minioadmin",
-				SecretKey: "minioadmin",
-			},
-		},
-	}
-}
+// func DefaultConfig() *Config {
+// 	return &Config{
+// 		Manager: DefaultManagerConfig(),
+// 		Backends: map[string]BackendConfig{
+// 			"local-minio": {
+// 				Endpoint:  "http://localhost:9000",
+// 				Region:    "us-east-1",
+// 				Bucket:    "test-bucket",
+// 				AccessKey: "minioadmin",
+// 				SecretKey: "minioadmin",
+// 			},
+// 		},
+// 	}
+// }
 
 // Validate проверяет корректность конфигурации
 func (c *Config) Validate() error {

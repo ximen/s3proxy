@@ -56,25 +56,25 @@ func NewAuthenticatorFromConfig(config *Config) (Authenticator, error) {
 }
 
 // DefaultConfig возвращает конфигурацию по умолчанию с тестовыми пользователями
-func DefaultConfig() *Config {
-	return &Config{
-		Provider: "static",
-		Static: &StaticConfig{
-			Users: []UserConfig{
-				{
-					AccessKey:   "AKIAIOSFODNN7EXAMPLE",
-					SecretKey:   "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-					DisplayName: "test-user",
-				},
-				{
-					AccessKey:   "AKIAYDR45T3E2EXAMPLE",
-					SecretKey:   "a82hdaHGTi92k/2kdldk29dGSH28skdEXAMPLEKEY",
-					DisplayName: "admin-user",
-				},
-			},
-		},
-	}
-}
+// func DefaultConfig() *Config {
+// 	return &Config{
+// 		Provider: "static",
+// 		Static: &StaticConfig{
+// 			Users: []UserConfig{
+// 				{
+// 					AccessKey:   "AKIAIOSFODNN7EXAMPLE",
+// 					SecretKey:   "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+// 					DisplayName: "test-user",
+// 				},
+// 				{
+// 					AccessKey:   "AKIAYDR45T3E2EXAMPLE",
+// 					SecretKey:   "a82hdaHGTi92k/2kdldk29dGSH28skdEXAMPLEKEY",
+// 					DisplayName: "admin-user",
+// 				},
+// 			},
+// 		},
+// 	}
+// }
 
 // Validate проверяет корректность конфигурации аутентификации
 func (c *Config) Validate() error {

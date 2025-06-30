@@ -1,0 +1,5 @@
+*.log
+s3proxy
+test*
+config.yml
+config-dev.yml

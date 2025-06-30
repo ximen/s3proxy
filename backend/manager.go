@@ -35,7 +35,13 @@ type Manager struct {
 // NewManager создает новый менеджер бэкендов
 func NewManager(cfg *Config) (*Manager, error) {
 	if cfg == nil {
-		cfg = DefaultConfig()
+		return nil, fmt.Errorf("Config for Backend Manager not provided")
+	}
+
+	// Если ManagerConfig не передан, используем дефолтный
+	managerConfig := cfg.Manager
+	if managerConfig == (ManagerConfig{}) {
+		managerConfig = DefaultManagerConfig()
 	}
 
 	// Валидируем конфигурацию
@@ -44,7 +50,7 @@ func NewManager(cfg *Config) (*Manager, error) {
 	}
 
 	manager := &Manager{
-		config:   cfg.Manager,
+		config:   managerConfig,
 		backends: make(map[string]*Backend),
 		metrics:  NewMetrics(),
 		stopChan: make(chan struct{}),

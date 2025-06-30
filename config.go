@@ -18,19 +18,19 @@ import (
 type AppConfig struct {
 	// Конфигурация API Gateway
 	Server ServerConfig `yaml:"server"`
-	
+
 	// Конфигурация логирования
 	Logging LoggingConfig `yaml:"logging"`
-	
+
 	// Конфигурация аутентификации
 	Auth auth.Config `yaml:"auth"`
-	
+
 	// Конфигурация бэкендов
 	Backend backend.Config `yaml:"backend"`
-	
+
 	// Конфигурация мониторинга
 	Monitoring monitoring.Config `yaml:"monitoring"`
-	
+
 	// Конфигурация политик маршрутизации
 	Routing routing.Config `yaml:"routing"`
 }
@@ -52,24 +52,24 @@ type LoggingConfig struct {
 }
 
 // DefaultAppConfig возвращает конфигурацию по умолчанию
-func DefaultAppConfig() *AppConfig {
-	return &AppConfig{
-		Server: ServerConfig{
-			ListenAddress: ":9000",
-			VirtualBucket: "s3proxy-bucket",
-			ReadTimeout:   30 * time.Second,
-			WriteTimeout:  30 * time.Second,
-			UseMock:       false,
-		},
-		Logging: LoggingConfig{
-			Level: "info",
-		},
-		Auth:       *auth.DefaultConfig(),
-		Backend:    *backend.DefaultConfig(),
-		Monitoring: *monitoring.DefaultConfig(),
-		Routing:    *routing.DefaultConfig(),
-	}
-}
+// func DefaultAppConfig() *AppConfig {
+// 	return &AppConfig{
+// 		Server: ServerConfig{
+// 			ListenAddress: ":9000",
+// 			VirtualBucket: "s3proxy-bucket",
+// 			ReadTimeout:   30 * time.Second,
+// 			WriteTimeout:  30 * time.Second,
+// 			UseMock:       false,
+// 		},
+// 		Logging: LoggingConfig{
+// 			Level: "info",
+// 		},
+// 		Auth:       *auth.DefaultConfig(),
+// 		Backend:    *backend.DefaultConfig(),
+// 		Monitoring: *monitoring.DefaultConfig(),
+// 		Routing:    *routing.DefaultConfig(),
+// 	}
+// }
 
 // LoadConfig загружает конфигурацию из файла
 func LoadConfig(filename string) (*AppConfig, error) {
@@ -78,20 +78,20 @@ func LoadConfig(filename string) (*AppConfig, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to read config file %s: %w", filename, err)
 	}
-	
-	// Начинаем с конфигурации по умолчанию
-	config := DefaultAppConfig()
-	
+
+	// Создаем пустую конфигурацию
+	config := &AppConfig{}
+
 	// Парсим YAML
 	if err := yaml.Unmarshal(data, config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", filename, err)
 	}
-	
+
 	// Валидируем конфигурацию
 	if err := config.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
-	
+
 	return config, nil
 }
 
@@ -101,39 +101,39 @@ func (c *AppConfig) Validate() error {
 	if c.Server.ListenAddress == "" {
 		return fmt.Errorf("server.listen_address cannot be empty")
 	}
-	
+
 	if c.Server.ReadTimeout <= 0 {
 		return fmt.Errorf("server.read_timeout must be positive")
 	}
-	
+
 	if c.Server.WriteTimeout <= 0 {
 		return fmt.Errorf("server.write_timeout must be positive")
 	}
-	
+
 	// Проверяем TLS конфигурацию
 	if (c.Server.TLSCertFile != "" && c.Server.TLSKeyFile == "") ||
 		(c.Server.TLSCertFile == "" && c.Server.TLSKeyFile != "") {
 		return fmt.Errorf("both tls_cert_file and tls_key_file must be specified for TLS")
 	}
-	
+
 	// Валидируем уровень логирования
 	if !isValidLogLevel(c.Logging.Level) {
 		return fmt.Errorf("invalid logging level: %s", c.Logging.Level)
 	}
-	
+
 	// Валидируем конфигурации модулей
 	if err := c.Auth.Validate(); err != nil {
 		return fmt.Errorf("auth config: %w", err)
 	}
-	
+
 	if err := c.Backend.Validate(); err != nil {
 		return fmt.Errorf("backend config: %w", err)
 	}
-	
+
 	if err := c.Monitoring.Validate(); err != nil {
 		return fmt.Errorf("monitoring config: %w", err)
 	}
-	
+
 	return nil
 }
 
@@ -165,10 +165,10 @@ func (c *AppConfig) SaveConfig(filename string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-	
+
 	if err := os.WriteFile(filename, data, 0644); err != nil {
 		return fmt.Errorf("failed to write config file %s: %w", filename, err)
 	}
-	
+
 	return nil
 }
