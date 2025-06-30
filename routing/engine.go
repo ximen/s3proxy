@@ -48,7 +48,7 @@ func NewEngine(
 
 // Handle - реализация интерфейса RequestHandler. Это точка входа в модуль
 func (e *Engine) Handle(req *apigw.S3Request) *apigw.S3Response {
-	logger.Debug("Policy & Routing Engine: handling request - Operation: %s, Bucket: %s, Key: %s", 
+	logger.Debug("Policy & Routing Engine: handling request - Operation: %s, Bucket: %s, Key: %s",
 		req.Operation, req.Bucket, req.Key)
 
 	// Шаг 1: Аутентификация
@@ -60,29 +60,29 @@ func (e *Engine) Handle(req *apigw.S3Request) *apigw.S3Response {
 		return e.createAuthErrorResponse(err)
 	}
 
-	logger.Info("Policy & Routing Engine received authenticated request:")
-	logger.Info("  User: %s (%s)", identity.DisplayName, identity.AccessKey)
-	logger.Info("  Operation: %s", req.Operation)
-	logger.Info("  Bucket: %s", req.Bucket)
-	logger.Info("  Key: %s", req.Key)
+	logger.Debug("Policy & Routing Engine received authenticated request:")
+	logger.Debug("  User: %s (%s)", identity.DisplayName, identity.AccessKey)
+	logger.Debug("  Operation: %s", req.Operation)
+	logger.Debug("  Bucket: %s", req.Bucket)
+	logger.Debug("  Key: %s", req.Key)
 
 	// Шаг 2: Авторизация (заглушка для будущего)
 	// TODO: Реализовать модуль авторизации
 	// isAuthorized := e.authorizer.Authorize(identity, req)
-	// if !isAuthorized { 
+	// if !isAuthorized {
 	//     return e.createAuthorizationErrorResponse()
 	// }
 	logger.Debug("Authorization check passed (not implemented yet)")
 
 	// Шаг 3: Маршрутизация на основе типа операции
 	logger.Debug("Routing request based on operation: %s", req.Operation)
-	
+
 	switch req.Operation {
 	// Операции записи - направляем в Replication Module
 	case apigw.PutObject:
 		logger.Debug("Routing to replicator.PutObject with policy: %+v", e.putPolicy)
 		return e.replicator.PutObject(req.Context, req, e.putPolicy)
-	
+
 	case apigw.DeleteObject:
 		logger.Debug("Routing to replicator.DeleteObject with policy: %+v", e.deletePolicy)
 		return e.replicator.DeleteObject(req.Context, req, e.deletePolicy)
@@ -170,14 +170,14 @@ func (e *Engine) createAuthErrorResponse(err error) *apigw.S3Response {
 		message = "Access Denied"
 		statusCode = http.StatusForbidden // 403 - общая ошибка доступа
 	}
-	
+
 	// Создать S3 XML тело ошибки
 	errorBody := e.formatS3ErrorXML(code, message)
-	
+
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/xml")
 	headers.Set("Content-Length", fmt.Sprintf("%d", len(errorBody)))
-	
+
 	return &apigw.S3Response{
 		StatusCode: statusCode,
 		Body:       io.NopCloser(strings.NewReader(errorBody)),
@@ -193,11 +193,11 @@ func (e *Engine) createOperationNotImplementedResponse(operation apigw.S3Operati
 	statusCode := http.StatusNotImplemented
 
 	errorBody := e.formatS3ErrorXML(code, message)
-	
+
 	headers := make(http.Header)
 	headers.Set("Content-Type", "application/xml")
 	headers.Set("Content-Length", fmt.Sprintf("%d", len(errorBody)))
-	
+
 	return &apigw.S3Response{
 		StatusCode: statusCode,
 		Body:       io.NopCloser(strings.NewReader(errorBody)),

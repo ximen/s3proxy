@@ -58,7 +58,7 @@ func (gw *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Логируем распарсенную операцию
 	logger.Debug("Parsed S3 request: %+v", s3req)
-	logger.Info("Parsed operation: %s, Bucket: %s, Key: %s",
+	logger.Debug("Parsed operation: %s, Bucket: %s, Key: %s",
 		s3req.Operation.String(), s3req.Bucket, s3req.Key)
 
 	// Передаем управление обработчику
@@ -71,7 +71,7 @@ func (gw *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Логируем ответ
-	logger.Info("Response sent: %d", s3resp.StatusCode)
+	logger.Info("Response sent: %d, %.3f ms", s3resp.StatusCode, float64(time.Since(start).Microseconds())/1000.0)
 
 	// Updateing metric
 	latency = time.Since(start).Seconds()
