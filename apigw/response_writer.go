@@ -49,7 +49,7 @@ func (rw *ResponseWriter) WriteResponse(w http.ResponseWriter, s3resp *S3Respons
 		logger.Debug("Writing response body")
 		_, err := io.Copy(w, s3resp.Body)
 		if err != nil {
-			logger.Debug("Error writing response body: %v", err)
+			logger.Error("Error writing response body: %v", err)
 		}
 		return err
 	}

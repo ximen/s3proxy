@@ -89,12 +89,32 @@ func (f *Fetcher) HeadBucket(ctx context.Context, req *apigw.S3Request) *apigw.S
 
 // ... другие методы List* можно отрефакторить аналогично, если они имеют схожие стратегии ...
 // (Оставляю их как есть для краткости, так как они не были причиной паники)
-func (f *Fetcher) ListObjects(ctx context.Context, req *apigw.S3Request) *apigw.S3Response { /* ... */
-	return nil
+func (f *Fetcher) ListObjects(ctx context.Context, req *apigw.S3Request) *apigw.S3Response {
+	backends := f.backendProvider.GetLiveBackends()
+	if len(backends) == 0 {
+		return &apigw.S3Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Headers:    make(http.Header),
+			Error:      fmt.Errorf("no live backends available"),
+		}
+	}
+
+	return f.listObjects(ctx, req, backends)
 }
-func (f *Fetcher) ListBuckets(ctx context.Context, req *apigw.S3Request) *apigw.S3Response { /* ... */
-	return nil
+
+func (f *Fetcher) ListBuckets(ctx context.Context, req *apigw.S3Request) *apigw.S3Response {
+	backends := f.backendProvider.GetLiveBackends()
+	if len(backends) == 0 {
+		return &apigw.S3Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Headers:    make(http.Header),
+			Error:      fmt.Errorf("no live backends available"),
+		}
+	}
+
+	return f.listBuckets(ctx, req, backends)
 }
+
 func (f *Fetcher) ListMultipartUploads(ctx context.Context, req *apigw.S3Request) *apigw.S3Response { /* ... */
 	return nil
 }
@@ -102,10 +122,13 @@ func (f *Fetcher) ListMultipartUploads(ctx context.Context, req *apigw.S3Request
 // --- Универсальные исполнители стратегий ---
 
 // executeFirst выполняет операцию op на всех бэкендах параллельно и возвращает первый успешный результат.
+// ВАЖНО: Эта версия НЕ отменяет остальные запросы, позволяя им завершиться для сбора
+// статистики (пассивного health-check'а).
 func (f *Fetcher) executeFirst(ctx context.Context, req *apigw.S3Request, backends []*backend.Backend, op backendOperation, methodName, notFoundMsg string) *apigw.S3Response {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
+	// НЕ создаем context.WithCancel, чтобы все запросы могли завершиться.
+	
+	// Буферизованный канал критически важен, чтобы предотвратить утечку горутин.
+	// Медленные горутины смогут записать результат и завершиться.
 	resultChan := make(chan *apigw.S3Response, len(backends))
 	var wg sync.WaitGroup
 
@@ -114,26 +137,23 @@ func (f *Fetcher) executeFirst(ctx context.Context, req *apigw.S3Request, backen
 		go func(b *backend.Backend) {
 			defer wg.Done()
 			start := time.Now()
+			
+			// Передаем родительский контекст `ctx` без изменений.
 			response := op(ctx, req, b)
 			latency := time.Since(start)
 
-			// Безопасно получаем количество прочитанных байт
 			var bytesRead int64
 			if counter, ok := response.Body.(*bytesCountingReader); ok && counter != nil {
 				bytesRead = counter.totalRead
 			}
 
-			// Определяем успешность и отправляем отчет
-			// Успешный ответ для 'first' - это любой 2xx статус.
 			isSuccess := response.Error == nil && response.StatusCode >= 200 && response.StatusCode < 300
 			if isSuccess {
 				f.backendProvider.ReportSuccess(&backend.BackendResult{
 					BackendID: b.ID, Method: methodName, StatusCode: response.StatusCode, Duration: latency, BytesRead: bytesRead,
 				})
-				select {
-				case resultChan <- response:
-				case <-ctx.Done():
-				}
+				// Просто отправляем результат. Так как канал буферизованный, это не заблокирует горутину.
+				resultChan <- response
 			} else {
 				f.backendProvider.ReportFailure(&backend.BackendResult{
 					BackendID: b.ID, Method: methodName, StatusCode: response.StatusCode, Err: response.Error, Duration: latency, BytesRead: bytesRead,
@@ -142,16 +162,22 @@ func (f *Fetcher) executeFirst(ctx context.Context, req *apigw.S3Request, backen
 		}(be)
 	}
 
+	// Эта горутина нужна только для того, чтобы закрыть канал после завершения всех воркеров.
+	// Это гарантирует, что `<-resultChan` не будет блокироваться вечно, если все запросы провалятся.
 	go func() {
 		wg.Wait()
 		close(resultChan)
 	}()
 
+	// Ждем первый успешный ответ из канала.
 	if res := <-resultChan; res != nil {
-		cancel() // Отменяем остальные запросы, как только получили первый успешный
+		// Мы получили самый быстрый ответ.
+		// НЕ вызываем cancel(), а просто возвращаем его.
+		// Остальные горутины продолжат работать в фоне и отправлять отчеты.
 		return res
 	}
 
+	// Сюда мы попадем, только если канал был закрыт и в нем не было ни одного успешного ответа.
 	return &apigw.S3Response{StatusCode: http.StatusNotFound, Error: errors.New(notFoundMsg)}
 }
 

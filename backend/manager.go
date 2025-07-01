@@ -2,7 +2,9 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go/middleware"
 	//"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/result"
 )
@@ -222,7 +225,41 @@ func (m *Manager) GetBackend(id string) (*Backend, bool) {
 	return backend, exists
 }
 
-// ReportSuccess сообщает об успешной операции (пассивная проверка)
+// isBenignError классифицирует ошибку как "безопасную", если она не указывает
+// на реальную проблему с бэкендом. Эта версия исправляет панику.
+func isBenignError(err error) bool {
+	if err == nil {
+		return true // Отсутствие ошибки.
+	}
+
+	// 1. Проверяем на отмену контекста. Это всегда безопасно.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+
+	// 2. Идиоматическая проверка на 404 Not Found для AWS SDK v2.
+	// Это самый надежный способ.
+	var notFoundError *types.NotFound
+	if errors.As(err, &notFoundError) {
+		return true // Это точно 404 Not Found, ошибка безопасна.
+	}
+
+	// 3. Общий fallback: проверяем всю цепочку на наличие любого типа,
+	// который может сообщить HTTP-код. Это делает функцию устойчивой
+	// к другим типам ошибок, которые могут вернуть 404.
+	var httpErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &httpErr) {
+		if httpErr.HTTPStatusCode() == http.StatusNotFound {
+			return true
+		}
+	}
+
+	// Все остальные ошибки (5xx, 403 Forbidden, сетевые проблемы) считаются критическими.
+	return false
+}
+
+// ReportSuccess сообщает об успешной операции.
+// Если бэкенд был в состоянии Down, эта функция возвращает его в строй.
 func (m *Manager) ReportSuccess(result *BackendResult) {
 	m.mu.RLock()
 	backend, exists := m.backends[result.BackendID]
@@ -236,24 +273,28 @@ func (m *Manager) ReportSuccess(result *BackendResult) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 
-	// Сбрасываем счетчик последовательных неудач
+	// Сбрасываем счетчики неудач
 	backend.consecutiveFailures = 0
 	backend.consecutiveSuccesses++
+	backend.recentFailures = 0 // Успех сбрасывает окно Circuit Breaker
 
-	// Очищаем окно Circuit Breaker при успехе
-	backend.recentFailures = 0
-	backend.windowStart = time.Now()
+	// Если бэкенд был отключен, успешный запрос возвращает его в строй.
+	if backend.state == StateDown {
+		logger.Info("Backend '%s' is back online after a successful request.", result.BackendID)
+		setBackendState(m, backend, StateUp)
+	}
 
 	logger.Debug("ReportSuccess: backend '%s', consecutive successes: %d",
 		result.BackendID, backend.consecutiveSuccesses)
 
+	// Обновляем метрики
 	m.metrics.BackendRequestsTotal.WithLabelValues(result.BackendID, result.Method, strconv.Itoa(result.StatusCode)).Inc()
 	m.metrics.BackendLatency.WithLabelValues(result.BackendID, result.Method).Observe(float64(result.Duration.Seconds()))
 	m.metrics.BackendBytesRead.WithLabelValues(result.BackendID).Add(float64(result.BytesRead))
 	m.metrics.BackendBytesWrite.WithLabelValues(result.BackendID).Add(float64(result.BytesWritten))
 }
 
-// ReportFailure сообщает о неудачной операции (пассивная проверка)
+// ReportFailure сообщает о неудачной операции, учитывая тип ошибки.
 func (m *Manager) ReportFailure(result *BackendResult) {
 	m.mu.RLock()
 	backend, exists := m.backends[result.BackendID]
@@ -264,10 +305,21 @@ func (m *Manager) ReportFailure(result *BackendResult) {
 		return
 	}
 
+	// --- Новая логика классификации ошибки ---
+	if isBenignError(result.Err) {
+		// Это "безопасная" ошибка. Мы логируем ее, но не наказываем бэкенд.
+		logger.Debug("ReportFailure: Benign error on backend '%s', not affecting circuit breaker. Error: %v",
+			result.BackendID, result.Err)
+		// Все равно обновляем метрики, так как запрос был
+		m.metrics.BackendRequestsTotal.WithLabelValues(result.BackendID, result.Method, strconv.Itoa(result.StatusCode)).Inc()
+		m.metrics.BackendLatency.WithLabelValues(result.BackendID, result.Method).Observe(float64(result.Duration.Seconds()))
+		return // ВАЖНО: выходим, не трогая счетчики Circuit Breaker
+	}
+
+	// --- Логика для КРИТИЧЕСКИХ ошибок (старая логика) ---
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
 
-	// Обновляем статистику
 	backend.consecutiveSuccesses = 0
 	backend.consecutiveFailures++
 	backend.lastError = result.Err
@@ -275,23 +327,23 @@ func (m *Manager) ReportFailure(result *BackendResult) {
 	// Обновляем окно Circuit Breaker
 	now := time.Now()
 	if now.Sub(backend.windowStart) > m.config.CircuitBreakerWindow {
-		// Сбрасываем окно
 		backend.recentFailures = 1
 		backend.windowStart = now
 	} else {
 		backend.recentFailures++
 	}
 
-	logger.Debug("ReportFailure: backend '%s', consecutive failures: %d, recent failures: %d, error: %v",
+	logger.Warn("ReportFailure: Critical failure on backend '%s', consecutive: %d, recent: %d. Error: %v",
 		result.BackendID, backend.consecutiveFailures, backend.recentFailures, result.Err)
 
-	// Проверяем Circuit Breaker
-	if backend.recentFailures >= m.config.CircuitBreakerThreshold && backend.state != StateDown {
-		logger.Warn("Circuit breaker triggered for backend '%s': %d failures in %v",
-			result.BackendID, backend.recentFailures, m.config.CircuitBreakerWindow)
+	// Проверяем, не пора ли отключить бэкенд
+	if backend.state != StateDown && backend.recentFailures >= m.config.CircuitBreakerThreshold {
+		logger.Error("Circuit breaker triggered for backend '%s': %d failures in %v. Setting state to DOWN.",
+			result.BackendID, backend.recentFailures, now.Sub(backend.windowStart))
 		setBackendState(m, backend, StateDown)
 	}
 
+	// Обновляем метрики
 	m.metrics.BackendRequestsTotal.WithLabelValues(result.BackendID, result.Method, strconv.Itoa(result.StatusCode)).Inc()
 	m.metrics.BackendLatency.WithLabelValues(result.BackendID, result.Method).Observe(float64(result.Duration.Seconds()))
 	m.metrics.BackendBytesRead.WithLabelValues(result.BackendID).Add(float64(result.BytesRead))
