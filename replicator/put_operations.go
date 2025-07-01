@@ -2,7 +2,6 @@ package replicator
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -10,9 +9,9 @@ import (
 	"time"
 
 	"s3proxy/apigw"
+	"s3proxy/backend"
 	"s3proxy/logger"
 	"s3proxy/routing"
-	"s3proxy/backend"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -71,44 +70,30 @@ func (r *Replicator) performPutSync(opCtx *operationContext, req *apigw.S3Reques
 	return r.aggregatePutResults(resultsChan, policy, len(backends))
 }
 
-func (r *Replicator) performPutToBackend(ctx context.Context, b *backend.Backend, req *apigw.S3Request, body io.Reader) *backend.BackendResult {
-	startTime := time.Now()
-
-	ctx, cancel := context.WithTimeout(ctx, r.config.OperationTimeout)
-	defer cancel()
-
-	countingReader := NewCountingReader(body)
-
-	// --- ВЫБОР КЛИЕНТА ---
-	// Делаем это ДО того, как начнем модифицировать putInput
-	isStreamingClient := b.StreamingPutClient != nil
-	clientToUse := b.S3Client
-	if isStreamingClient {
-		logger.Debug("Using dedicated streaming client for PutObject on backend %s", b.ID)
-		clientToUse = b.StreamingPutClient
-	}
-
+// buildPutObjectInput инкапсулирует сложную логику преобразования
+// входящего HTTP-запроса в нативный s3.PutObjectInput для AWS SDK.
+// Эта функция ничего не отправляет, только собирает структуру.
+func (r *Replicator) buildPutObjectInput(req *apigw.S3Request, body io.Reader, b *backend.Backend) *s3.PutObjectInput {
 	// 1. Создаем "скелет" запроса с обязательными полями
 	putInput := &s3.PutObjectInput{
 		Bucket: aws.String(b.Config.Bucket),
 		Key:    aws.String(req.Key),
-		Body:   countingReader,
+		Body:   body,
 	}
 
-	// 2. Явно указываем ContentLength. Это критически важно для корректной подписи
-	// и обработки запроса на стороне S3-совместимого хранилища.
+	// 2. Явно указываем ContentLength.
 	if req.ContentLength > 0 {
 		putInput.ContentLength = aws.Int64(req.ContentLength)
 	}
 
-	// 3. Перебираем заголовки входящего запроса и "перекладываем" их в поля PutObjectInput.
-	// Это - необходимая логика прокси, которую нельзя автоматизировать через SDK.
+	// 3. Перебираем заголовки и "перекладываем" их в поля PutObjectInput.
 	metadata := make(map[string]string)
+	isStreamingClient := b.StreamingPutClient != nil
+
 	for key, values := range req.Headers {
 		if len(values) == 0 {
 			continue
 		}
-		// Используем каноническое имя заголовка (например, "Content-Type")
 		canonicalKey := http.CanonicalHeaderKey(key)
 		value := values[0]
 
@@ -123,20 +108,19 @@ func (r *Replicator) performPutToBackend(ctx context.Context, b *backend.Backend
 			putInput.CacheControl = aws.String(value)
 		case "X-Amz-Storage-Class":
 			putInput.StorageClass = types.StorageClass(value)
-		// Если клиент прислал SHA256 хэш, мы ему доверяем и используем его!
-		// Это избавляет SDK от необходимости читать поток для вычисления хэша.
+		// Если клиент прислал SHA256 хэш, доверяем ему. Это экономит чтение потока.
+		// НЕ используем для streaming-клиента, так как он вычисляет его сам.
 		case "X-Amz-Content-Sha256":
 			if !isStreamingClient {
 				putInput.ChecksumSHA256 = aws.String(value)
 			}
-		// Игнорируем только то, что относится к подписи и транспорту
-		case "Authorization", "X-Amz-Date", "Host", "Content-Length":
+		// Игнорируем заголовки, относящиеся к аутентификации и транспорту
+		case "Authorization", "X-Amz-Date", "Host", "Content-Length", "Expect":
 			continue
 		default:
-			// Все, что начинается с "X-Amz-Meta-", складываем в метаданные.
 			if strings.HasPrefix(canonicalKey, "X-Amz-Meta-") {
 				metaKey := strings.TrimPrefix(canonicalKey, "X-Amz-Meta-")
-				metadata[strings.ToLower(metaKey)] = value // Ключи метаданных принято хранить в нижнем регистре
+				metadata[strings.ToLower(metaKey)] = value
 			}
 		}
 	}
@@ -145,61 +129,56 @@ func (r *Replicator) performPutToBackend(ctx context.Context, b *backend.Backend
 		putInput.Metadata = metadata
 	}
 
+	return putInput
+}
+
+// performPutToBackend выполняет ОДНУ попытку отправки объекта на бэкенд.
+// Логика повторных попыток (retries) должна быть реализована на уровне выше.
+func (r *Replicator) performPutToBackend(ctx context.Context, b *backend.Backend, req *apigw.S3Request, body io.Reader) *backend.BackendResult {
+	startTime := time.Now()
+
+	// Устанавливаем таймаут на операцию
+	ctx, cancel := context.WithTimeout(ctx, r.config.OperationTimeout)
+	defer cancel()
+
+	// Оборачиваем тело для подсчета байт
+	countingReader := NewCountingReader(body)
+
+	// 1. Собираем запрос с помощью новой функции-хелпера
+	putInput := r.buildPutObjectInput(req, countingReader, b)
+
+	// 2. Выбираем правильный S3 клиент (обычный или для стриминга)
+	clientToUse := b.S3Client
+	if b.StreamingPutClient != nil {
+		logger.Debug("Using dedicated streaming client for PutObject on backend %s", b.ID)
+		clientToUse = b.StreamingPutClient
+	}
+
 	logger.Debug(
-		"performPutToBackend: sending PUT to backend %s (Bucket: %s, Key: %s) with ContentLength=%d, Metadata: %v",
-		b.ID, *putInput.Bucket, *putInput.Key, req.ContentLength, putInput.Metadata,
+		"performPutToBackend: sending PUT to backend %s (Bucket: %s, Key: %s) with ContentLength=%d",
+		b.ID, *putInput.Bucket, *putInput.Key, req.ContentLength,
 	)
 
-	// Выполняем запрос с повторами, используя ВЫБРАННЫЙ клиент
-	var response *s3.PutObjectOutput
-	var err error
-
-	for attempt := 0; attempt <= r.config.RetryAttempts; attempt++ {
-		if attempt > 0 {
-			// Перед повторной попыткой необходимо "перемотать" reader в начало,
-			// если он поддерживает io.Seeker.
-			if seeker, ok := putInput.Body.(io.Seeker); ok {
-				_, _ = seeker.Seek(0, io.SeekStart)
-			}
-			logger.Debug("performPutToBackend: retry attempt %d for backend %s", attempt, b.ID)
-			time.Sleep(r.config.RetryDelay)
-		}
-
-		response, err = clientToUse.PutObject(ctx, putInput)
-		if err == nil {
-			break
-		}
-		logger.Debug("performPutToBackend: attempt %d failed for backend %s: %v", attempt+1, b.ID, err)
-
-		// Оптимизация: нет смысла повторять запрос, если это ошибка клиента (4xx)
-		var responseError interface {
-			HTTPStatusCode() int
-		}
-		if ok := errors.As(err, &responseError); ok {
-			if responseError.HTTPStatusCode() >= 400 && responseError.HTTPStatusCode() < 500 {
-				logger.Error("performPutToBackend: received client error %d, stopping retries.", responseError.HTTPStatusCode())
-				break
-			}
-		}
-	}
+	// 3. Выполняем ОДНУ попытку запроса
+	response, err := clientToUse.PutObject(ctx, putInput)
 
 	duration := time.Since(startTime)
 	bytesWritten := countingReader.Count()
 
+	// 4. Логируем результат и возвращаем его
 	if err != nil {
-		logger.Error("performPutToBackend: failed on backend %s after retries: %v", b.ID, err)
+		logger.Error("performPutToBackend: failed on backend %s: %v", b.ID, err)
 	} else {
 		logger.Debug("performPutToBackend: success on backend %s, bytes=%d, duration=%v", b.ID, bytesWritten, duration)
 	}
 
-	return & backend.BackendResult{
+	return &backend.BackendResult{
 		BackendID:    b.ID,
 		Method:       "PUT",
 		Response:     response,
 		Err:          err,
 		Duration:     duration,
 		BytesWritten: bytesWritten,
-		BytesRead: 	  0,
 	}
 }
 
